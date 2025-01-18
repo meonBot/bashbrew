@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,20 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/docker-library/bashbrew/manifest"
+	"github.com/docker-library/bashbrew/pkg/dockerfile"
 	"github.com/urfave/cli"
 )
-
-type dockerfileMetadata struct {
-	StageFroms     []string          // every image "FROM" instruction value (or the parent stage's FROM value in the case of a named stage)
-	StageNames     []string          // the name of any named stage (in order)
-	StageNameFroms map[string]string // map of stage names to FROM values (or the parent stage's FROM value in the case of a named stage), useful for resolving stage names to FROM values
-
-	Froms []string // every "FROM" or "COPY --from=xxx" value (minus named and/or numbered stages in the case of "--from=")
-}
 
 // this returns the "FROM" value for the last stage (which essentially determines the "base" for the final published image)
 func (r Repo) ArchLastStageFrom(arch string, entry *manifest.Manifest2822Entry) (string, error) {
@@ -46,16 +38,25 @@ func (r Repo) ArchDockerFroms(arch string, entry *manifest.Manifest2822Entry) ([
 	return dockerfileMeta.Froms, nil
 }
 
-func (r Repo) dockerfileMetadata(entry *manifest.Manifest2822Entry) (*dockerfileMetadata, error) {
+func (r Repo) dockerfileMetadata(entry *manifest.Manifest2822Entry) (dockerfile.Metadata, error) {
 	return r.archDockerfileMetadata(arch, entry)
 }
 
-var dockerfileMetadataCache = map[string]*dockerfileMetadata{}
+var (
+	dockerfileMetadataCache   = map[string]dockerfile.Metadata{}
+	scratchDockerfileMetadata = sync.OnceValues(func() (dockerfile.Metadata, error) {
+		return dockerfile.Parse(`FROM scratch`)
+	})
+)
 
-func (r Repo) archDockerfileMetadata(arch string, entry *manifest.Manifest2822Entry) (*dockerfileMetadata, error) {
+func (r Repo) archDockerfileMetadata(arch string, entry *manifest.Manifest2822Entry) (dockerfile.Metadata, error) {
+	if builder := entry.ArchBuilder(arch); builder == "oci-import" {
+		return scratchDockerfileMetadata()
+	}
+
 	commit, err := r.fetchGitRepo(arch, entry)
 	if err != nil {
-		return nil, cli.NewMultiError(fmt.Errorf("failed fetching Git repo for arch %q from entry %q", arch, entry.String()), err)
+		return dockerfile.Metadata{}, cli.NewMultiError(fmt.Errorf("failed fetching Git repo for arch %q from entry %q", arch, entry.String()), err)
 	}
 
 	dockerfileFile := path.Join(entry.ArchDirectory(arch), entry.ArchFile(arch))
@@ -68,113 +69,17 @@ func (r Repo) archDockerfileMetadata(arch string, entry *manifest.Manifest2822En
 		return meta, nil
 	}
 
-	dockerfile, err := gitShow(commit, dockerfileFile)
+	df, err := gitShow(commit, dockerfileFile)
 	if err != nil {
-		return nil, cli.NewMultiError(fmt.Errorf(`failed "git show" for %q from commit %q`, dockerfileFile, commit), err)
+		return dockerfile.Metadata{}, cli.NewMultiError(fmt.Errorf(`failed "git show" for %q from commit %q`, dockerfileFile, commit), err)
 	}
 
-	meta, err := parseDockerfileMetadata(dockerfile)
+	meta, err := dockerfile.Parse(df)
 	if err != nil {
-		return nil, cli.NewMultiError(fmt.Errorf(`failed parsing Dockerfile metadata for %q from commit %q`, dockerfileFile, commit), err)
+		return dockerfile.Metadata{}, cli.NewMultiError(fmt.Errorf(`failed parsing Dockerfile metadata for %q from commit %q`, dockerfileFile, commit), err)
 	}
 
 	dockerfileMetadataCache[cacheKey] = meta
-	return meta, nil
-}
-
-func parseDockerfileMetadata(dockerfile string) (*dockerfileMetadata, error) {
-	meta := &dockerfileMetadata{
-		// panic: assignment to entry in nil map
-		StageNameFroms: map[string]string{},
-		// (nil slices work fine)
-	}
-
-	scanner := bufio.NewScanner(strings.NewReader(dockerfile))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		if line == "" {
-			// ignore blank lines
-			continue
-		}
-
-		if line[0] == '#' {
-			// TODO handle "escape" parser directive
-			// TODO handle "syntax" parser directive -- explode appropriately (since custom syntax invalidates our Dockerfile parsing)
-			// ignore comments
-			continue
-		}
-
-		// handle line continuations
-		// (TODO see note above regarding "escape" parser directive)
-		for line[len(line)-1] == '\\' && scanner.Scan() {
-			nextLine := strings.TrimSpace(scanner.Text())
-			if nextLine == "" || nextLine[0] == '#' {
-				// ignore blank lines and comments
-				continue
-			}
-			line = line[0:len(line)-1] + nextLine
-		}
-
-		fields := strings.Fields(line)
-		if len(fields) < 1 {
-			// must be a much more complex empty line??
-			continue
-		}
-		instruction := strings.ToUpper(fields[0])
-
-		// TODO balk at ARG / $ in from values
-
-		switch instruction {
-		case "FROM":
-			from := fields[1]
-
-			if stageFrom, ok := meta.StageNameFroms[from]; ok {
-				// if this is a valid stage name, we should resolve it back to the original FROM value of that previous stage (we don't care about inter-stage dependencies for the purposes of either tag dependency calculation or tag building -- just how many there are and what external things they require)
-				from = stageFrom
-			}
-
-			// make sure to add ":latest" if it's implied
-			from = latestizeRepoTag(from)
-
-			meta.StageFroms = append(meta.StageFroms, from)
-			meta.Froms = append(meta.Froms, from)
-
-			if len(fields) == 4 && strings.ToUpper(fields[2]) == "AS" {
-				stageName := fields[3]
-				meta.StageNames = append(meta.StageNames, stageName)
-				meta.StageNameFroms[stageName] = from
-			}
-		case "COPY":
-			for _, arg := range fields[1:] {
-				if !strings.HasPrefix(arg, "--") {
-					// doesn't appear to be a "flag"; time to bail!
-					break
-				}
-				if !strings.HasPrefix(arg, "--from=") {
-					// ignore any flags we're not interested in
-					continue
-				}
-				from := arg[len("--from="):]
-
-				if stageFrom, ok := meta.StageNameFroms[from]; ok {
-					// see note above regarding stage names in FROM
-					from = stageFrom
-				} else if stageNumber, err := strconv.Atoi(from); err == nil && stageNumber < len(meta.StageFroms) {
-					// must be a stage number, we should resolve it too
-					from = meta.StageFroms[stageNumber]
-				}
-
-				// make sure to add ":latest" if it's implied
-				from = latestizeRepoTag(from)
-
-				meta.Froms = append(meta.Froms, from)
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
 	return meta, nil
 }
 
@@ -242,9 +147,16 @@ func (r Repo) dockerBuildUniqueBits(entry *manifest.Manifest2822Entry) ([]string
 	return uniqueBits, nil
 }
 
-func dockerBuild(tag string, file string, context io.Reader, platform string) error {
-	args := []string{"build", "--tag", tag, "--file", file, "--rm", "--force-rm"}
-	args = append(args, "-")
+func dockerBuild(tags []string, file string, context io.Reader, platform string) error {
+	args := []string{"build"}
+	for _, tag := range tags {
+		args = append(args, "--tag", tag)
+	}
+	if file != "" {
+		args = append(args, "--file", file)
+	}
+	args = append(args, "--rm", "--force-rm", "-")
+
 	cmd := exec.Command("docker", args...)
 	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=0")
 	if debugFlag {
@@ -276,9 +188,13 @@ func dockerBuild(tag string, file string, context io.Reader, platform string) er
 	}
 }
 
-const dockerfileSyntaxEnv = "BASHBREW_BUILDKIT_SYNTAX"
+const (
+	dockerfileSyntaxEnv = "BASHBREW_BUILDKIT_SYNTAX"
+	sbomGeneratorEnv    = "BASHBREW_BUILDKIT_SBOM_GENERATOR"
+	buildxBuilderEnv    = "BUILDX_BUILDER"
+)
 
-func dockerBuildxBuild(tag string, file string, context io.Reader, platform string) error {
+func dockerBuildxBuild(tags []string, file string, context io.Reader, platform string) error {
 	dockerfileSyntax, ok := os.LookupEnv(dockerfileSyntaxEnv)
 	if !ok {
 		return fmt.Errorf("missing %q", dockerfileSyntaxEnv)
@@ -289,26 +205,89 @@ func dockerBuildxBuild(tag string, file string, context io.Reader, platform stri
 		"build",
 		"--progress", "plain",
 		"--build-arg", "BUILDKIT_SYNTAX=" + dockerfileSyntax,
-		"--tag", tag,
-		"--file", file,
+	}
+	buildxBuilder := "" != os.Getenv(buildxBuilderEnv)
+	if buildxBuilder {
+		args = append(args, "--provenance", "mode=max")
+	}
+	if sbomGenerator, ok := os.LookupEnv(sbomGeneratorEnv); ok {
+		if buildxBuilder {
+			args = append(args, "--sbom", "generator="+sbomGenerator)
+		} else {
+			return fmt.Errorf("have %q but missing %q", sbomGeneratorEnv, buildxBuilderEnv)
+		}
 	}
 	if platform != "" {
 		args = append(args, "--platform", platform)
 	}
+	for _, tag := range tags {
+		args = append(args, "--tag", tag)
+	}
+	if file != "" {
+		args = append(args, "--file", file)
+	}
 	args = append(args, "-")
+
+	if buildxBuilder {
+		args = append(args, "--output", "type=oci")
+		// TODO ,annotation.xyz.tianon.foo=bar,annotation-manifest-descriptor.xyz.tianon.foo=bar (for OCI source annotations, which this function doesn't currently have access to)
+	}
 
 	cmd := exec.Command("docker", args...)
 	cmd.Stdin = context
+
+	run := func() error {
+		return cmd.Run()
+	}
+	if buildxBuilder {
+		run = func() error {
+			pipe, err := cmd.StdoutPipe()
+			if err != nil {
+				return err
+			}
+			defer pipe.Close()
+
+			err = cmd.Start()
+			if err != nil {
+				return err
+			}
+			defer cmd.Process.Kill()
+
+			_, err = containerdImageLoad(pipe)
+			if err != nil {
+				return err
+			}
+			pipe.Close()
+
+			err = cmd.Wait()
+			if err != nil {
+				return err
+			}
+
+			desc, err := containerdImageLookup(tags[0])
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("Importing %s into Docker\n", desc.Digest)
+			err = containerdDockerLoad(*desc, tags)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		}
+	}
+
+	// intentionally not touching os.Stdout because "buildx build" does *not* put any build output to stdout and in some cases (see above) we use stdout to capture an OCI tarball and pipe it into containerd
 	if debugFlag {
-		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		fmt.Printf("$ docker %q\n", args)
-		return cmd.Run()
+		return run()
 	} else {
 		buf := &bytes.Buffer{}
-		cmd.Stdout = buf
 		cmd.Stderr = buf
-		err := cmd.Run()
+		err := run()
 		if err != nil {
 			err = cli.NewMultiError(err, fmt.Errorf(`docker %q output:%s`, args, "\n"+buf.String()))
 		}

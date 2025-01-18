@@ -1,11 +1,11 @@
-FROM golang:1.18-bullseye
+FROM golang:1.21-bookworm
 
 SHELL ["bash", "-Eeuo", "pipefail", "-xc"]
 
 RUN apt-get update; \
 	apt-get install -y --no-install-recommends \
 		file \
-		gnupg dirmngr \
+		gnupg \
 		wget \
 	; \
 	rm -rf /var/lib/apt/lists/*
